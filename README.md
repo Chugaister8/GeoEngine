@@ -695,48 +695,6 @@ engine.iot.on('reading', (sensor) => {
 
 ---
 
-## ◈ ДОРОЖНЯ КАРТА
-
-```
-ФАЗА 1 — MVP                     [ Q1 2025 ]
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  ✦ Python DEM парсер (SRTM, Copernicus)
-  ✦ Heightmap → Triangle mesh конвертер
-  ✦ Three.js WebGPU базовий terrain рендер
-  ✦ Orbit camera + базові контролі
-  ✦ FastAPI WebSocket Python↔JS bridge
-  ✦ Demo: Карпати у 3D з реальних даних
-
-ФАЗА 2 — CORE FEATURES            [ Q2 2025 ]
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  ✦ Quadtree LOD (5 рівнів)
-  ✦ Satellite texture тайли (MapTiler)
-  ✦ OSM будівлі → 3D (LOD1/LOD2)
-  ✦ Python публічний API v0.1
-  ✦ Атмосфера, PBR матеріали, тіні
-  ✦ Viewshed аналіз
-
-ФАЗА 3 — ADVANCED                 [ Q3 2025 ]
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  ✦ LiDAR точки (LAS/LAZ)
-  ✦ AI сегментація знімків (SAM2)
-  ✦ Flood / Fire симуляції
-  ✦ WebXR (VR/AR)
-  ✦ Real-time IoT / GPS треки
-  ✦ Digital Twin модуль
-
-ФАЗА 4 — PLATFORM                 [ Q4 2025 ]
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  ✦ Plugin система
-  ✦ Collaboration (multi-user)
-  ✦ Photogrammetry pipeline
-  ✦ Mars / Moon підтримка
-  ✦ Enterprise (auth, E2E, air-gap)
-  ✦ Публічний реліз v1.0
-```
-
----
-
 ## ◈ ТЕХНІЧНІ ХАРАКТЕРИСТИКИ
 
 ```
@@ -780,32 +738,13 @@ engine.iot.on('reading', (sensor) => {
 ║   "Real data. Real physics. Real Python."            ║
 ║                                                      ║
 ║   Ми не будуємо ще один рендер.                      ║
-║   Ми будуємо операційну систему для Землі.           ║
+║   Ми будуємо операційну систему.           ║
 ║                                                      ║
-║   Відкрита. Розширювана. Точна.                      ║
+║   Розширювана. Точна.                      ║
 ║   Python-first. WebGPU-ready. AI-native.             ║
 ║                                                      ║
 ╚══════════════════════════════════════════════════════╝
 
-ПРИНЦИПИ:
-
-  ◈  ВІДКРИТІСТЬ        Відкритий код, відкриті стандарти,
-                        відкриті дані де можливо
-
-  ◈  ТОЧНІСТЬ           Реальні геодані — основа всього.
-                        Не процедурна імітація, а факти
-
-  ◈  PYTHON FIRST       Python — повноцінна мова платформи,
-                        а не тонка обгортка над JS
-
-  ◈  МАСШТАБОВАНІСТЬ    Від 1мм до планети —
-                        без компромісів з продуктивністю
-
-  ◈  МОДУЛЬНІСТЬ        Бери тільки те що потрібно.
-                        Підключай своє через Plugin API
-
-  ◈  OFFLINE READY      Критичні застосунки не можуть
-                        залежати від інтернету
 ```
 
 ---
@@ -813,10 +752,13 @@ engine.iot.on('reading', (sensor) => {
 ## ◈ ЛІЦЕНЗІЯ ТА УМОВИ
 
 ```
-Ядро (Core):         MIT License — вільно для будь-якого використання
-Enterprise модулі:   Комерційна ліцензія
-Супутникові дані:    Залежить від джерела (Copernicus: безкоштовно)
-OSM дані:            ODbL (Open Database License)
+© [Chugaister8] [2026]. Всі права захищені.
+
+Цей код є приватною власністю. Будь-яке використання, копіювання, модифікація або поширення без явної письмової згоди автора **заборонено**.
+
+© [Chugaister8] [2026]. All rights reserved.
+
+This code is proprietary. No permission is granted to use, copy, modify, merge, publish, distribute, sublicense, or sell copies of the software without explicit prior written permission from the author.
 ```
 
 ---
