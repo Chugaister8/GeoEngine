@@ -1,0 +1,31 @@
+{
+  "compilerOptions": {
+    "target":           "ES2022",
+    "module":           "ESNext",
+    "moduleResolution": "bundler",
+    "lib":              ["ES2022"],
+
+    /* Type checking — максимально строгий */
+    "strict":                        true,
+    "noUncheckedIndexedAccess":      true,
+    "noImplicitOverride":            true,
+    "noPropertyAccessFromIndexSignature": true,
+    "exactOptionalPropertyTypes":    true,
+
+    /* Output */
+    "declaration":      true,
+    "declarationMap":   true,
+    "sourceMap":        true,
+    "outDir":           "./dist",
+    "rootDir":          "./src",
+
+    /* Interop */
+    "esModuleInterop":  true,
+    "forceConsistentCasingInFileNames": true,
+
+    /* Paths */
+    "baseUrl": "."
+  },
+  "include": ["src/**/*.ts"],
+  "exclude": ["node_modules", "dist"]
+}
