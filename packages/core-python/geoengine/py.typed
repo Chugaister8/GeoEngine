@@ -1,0 +1,2 @@
+# Marker file — PEP 561
+# Вказує mypy/pyright що цей пакет має вбудовані типи
