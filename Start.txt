@@ -1,0 +1,12 @@
+# 1. Встановити залежності
+pnpm install
+uv sync --all-packages
+
+# 2. Python сервер
+cd apps/server
+uvicorn src.main:app --reload --port 8000
+
+# 3. Next.js вьюер
+cd apps/viewer
+pnpm dev
+# → http://localhost:3000
