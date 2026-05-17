@@ -1,0 +1,253 @@
+# GeoEngine — CI Pipeline
+# Запускається при push та pull_request на main/develop
+
+name: CI
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+env:
+  PYTHON_VERSION: "3.12"
+  NODE_VERSION:   "20"
+  PNPM_VERSION:   "9.0.0"
+
+# ================================================================
+# JOBS
+# ================================================================
+jobs:
+
+  # ---- Python: lint + typecheck + tests ----
+  python:
+    name: Python (lint + types + tests)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install system deps (GDAL, PROJ)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y --no-install-recommends \
+            libgdal-dev gdal-bin libproj-dev proj-bin
+
+      - name: Install Python dependencies
+        run: |
+          uv sync --all-packages --frozen
+
+      - name: Ruff lint
+        run: |
+          uv run ruff check packages/core-python apps/server
+
+      - name: Ruff format check
+        run: |
+          uv run ruff format --check packages/core-python apps/server
+
+      - name: Mypy type check (core-python)
+        run: |
+          uv run mypy packages/core-python/geoengine \
+            --ignore-missing-imports \
+            --strict
+
+      - name: Pytest (unit tests)
+        run: |
+          uv run pytest tests/python/ \
+            -v \
+            --cov=packages/core-python/geoengine \
+            --cov-report=xml \
+            --cov-report=term-missing \
+            -x
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./coverage.xml
+          flags: python
+        continue-on-error: true
+
+  # ---- JavaScript/TypeScript: lint + typecheck + tests ----
+  javascript:
+    name: JavaScript (lint + types + tests)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v3
+        with:
+          version: ${{ env.PNPM_VERSION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build shared packages
+        run: pnpm --filter @geoengine/shared-types build
+
+      - name: TypeScript check (shared-types)
+        run: pnpm --filter @geoengine/shared-types typecheck
+
+      - name: Build core-js
+        run: pnpm --filter @geoengine/core-js build
+
+      - name: TypeScript check (core-js)
+        run: pnpm --filter @geoengine/core-js typecheck
+
+      - name: TypeScript check (viewer)
+        run: pnpm --filter @geoengine/viewer typecheck
+
+      - name: Vitest (unit tests)
+        run: |
+          pnpm --filter @geoengine/core-js test \
+            --reporter=verbose \
+            --coverage
+
+      - name: Upload JS coverage
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./packages/core-js/coverage/lcov.info
+          flags: javascript
+        continue-on-error: true
+
+  # ---- Docker build verification ----
+  docker:
+    name: Docker build
+    runs-on: ubuntu-latest
+    needs: [python, javascript]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build server image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: apps/server/Dockerfile
+          target: production
+          push: false
+          tags: geoengine/server:ci
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+
+      - name: Build viewer image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: apps/viewer/Dockerfile
+          target: production
+          push: false
+          tags: geoengine/viewer:ci
+          build-args: |
+            NEXT_PUBLIC_WS_URL=ws://localhost:8000/ws
+            NEXT_PUBLIC_API_URL=http://localhost:8000
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+
+  # ---- Integration test (docker-compose) ----
+  integration:
+    name: Integration tests
+    runs-on: ubuntu-latest
+    needs: docker
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create .env
+        run: |
+          cp .env.example .env
+          echo "GEOENGINE_DEBUG=true" >> .env
+          echo "BUILD_TARGET=production" >> .env
+
+      - name: Start services
+        run: |
+          docker compose up -d server redis
+          sleep 20
+
+      - name: Health check
+        run: |
+          curl -f http://localhost:8000/health
+          echo "Server health: OK"
+
+      - name: API smoke test
+        run: |
+          curl -f "http://localhost:8000/api/terrain/sources"
+          echo "Sources endpoint: OK"
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
+
+  # ---- Publish (тільки на main) ----
+  publish:
+    name: Publish Docker images
+    runs-on: ubuntu-latest
+    needs: [python, javascript, integration]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ghcr.io/${{ github.repository }}/server
+            ghcr.io/${{ github.repository }}/viewer
+          tags: |
+            type=ref,event=branch
+            type=sha,prefix=sha-
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push server
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: apps/server/Dockerfile
+          target: production
+          push: true
+          tags: ghcr.io/${{ github.repository }}/server:latest
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
+
+      - name: Build and push viewer
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: apps/viewer/Dockerfile
+          target: production
+          push: true
+          tags: ghcr.io/${{ github.repository }}/viewer:latest
+          build-args: |
+            NEXT_PUBLIC_WS_URL=${{ vars.NEXT_PUBLIC_WS_URL }}
+            NEXT_PUBLIC_API_URL=${{ vars.NEXT_PUBLIC_API_URL }}
+          cache-from: type=gha
+          cache-to:   type=gha,mode=max
