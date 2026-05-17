@@ -1,0 +1,49 @@
+# GeoEngine — .dockerignore
+# Виключаємо непотрібне з Docker build context
+
+# Git
+.git
+.gitignore
+.github
+
+# Python
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+**/*.egg-info
+**/.venv
+**/venv
+
+# Node.js
+**/node_modules
+**/.next
+**/dist
+**/.turbo
+**/*.tsbuildinfo
+
+# Дані та кеш
+data/
+**/.geoengine/
+**/dem_cache/
+**/osm_cache/
+
+# IDE
+.vscode
+.idea
+**/*.swp
+**/*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Документація (не потрібна в image)
+docs/
+*.md
+!apps/server/README.md
+
+# Тести (не потрібні в production image)
+tests/
