@@ -1,0 +1,127 @@
+# GeoEngine — .gitignore
+
+# ================================================================
+# Python
+# ================================================================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+dist/
+build/
+*.dist-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Testing
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+.tox/
+
+# Type checking
+.mypy_cache/
+.pyright/
+pyrightconfig.json
+
+# Linting
+.ruff_cache/
+
+# uv
+.uv/
+uv.lock
+
+# ================================================================
+# JavaScript / Node.js
+# ================================================================
+node_modules/
+.pnp
+.pnp.js
+
+# Next.js
+.next/
+out/
+
+# Build outputs
+dist/
+build/
+*.tsbuildinfo
+.turbo/
+
+# Testing
+coverage/
+*.lcov
+
+# ================================================================
+# Editors / IDEs
+# ================================================================
+.vscode/
+!.vscode/extensions.json
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+.DS_Store
+Thumbs.db
+
+# ================================================================
+# Environment та секрети
+# ================================================================
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# API ключі
+*.key
+*.pem
+*.crt
+secrets/
+
+# ================================================================
+# Дані та кеш
+# ================================================================
+data/
+*.geoengine/
+dem_cache/
+osm_cache/
+tile_cache/
+
+# GeoTIFF та великі файли
+*.tif
+*.tiff
+*.hgt
+*.las
+*.laz
+
+# ================================================================
+# Docker
+# ================================================================
+docker-compose.override.yml
+
+# ================================================================
+# Логи
+# ================================================================
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# ================================================================
+# Різне
+# ================================================================
+*.bak
+*.tmp
+*.temp
+.cache/
