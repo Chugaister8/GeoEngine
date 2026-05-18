@@ -1,13 +1,11 @@
 """
-GeoEngine — Base Configuration
-Базовий Pydantic Settings клас для всіх компонентів.
-
-Кожен компонент (server, cli, jupyter) наслідує BaseGeoConfig
-та додає власні поля.
+GeoEngine — Configuration
+Pydantic Settings для всієї конфігурації.
 """
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -18,116 +16,78 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class BaseGeoConfig(BaseSettings):
     """
     Базова конфігурація GeoEngine.
-    Читає змінні середовища з префіксом GEOENGINE_.
-
-    Поля:
-        log_level:    рівень логування
-        debug:        режим відлагодження
-        cache_dir:    директорія кешу
-        data_dir:     директорія даних
-        dem_api_keys: API ключі для DEM джерел
+    Всі параметри можна перевизначити через .env або змінні середовища.
     """
 
     model_config = SettingsConfigDict(
-        env_prefix="GEOENGINE_",
         env_file=".env",
         env_file_encoding="utf-8",
-        case_sensitive=False,
+        env_prefix="GEOENGINE_",
         extra="ignore",
+        case_sensitive=False,
     )
 
-    # ---- Загальні ----
-    log_level:   str  = Field(default="INFO",  description="Рівень логування")
-    debug:       bool = Field(default=False,   description="Режим відлагодження")
-    json_logs:   bool = Field(default=False,   description="JSON логи (для prod)")
+    # ---- Server ----
+    host:       str   = Field(default="0.0.0.0",   description="Bind host")
+    port:       int   = Field(default=8000,         description="HTTP port")
+    debug:      bool  = Field(default=False,        description="Debug mode")
+    log_level:  str   = Field(default="INFO",       description="Log level")
+    json_logs:  bool  = Field(default=False,        description="JSON logs")
 
-    # ---- Директорії ----
-    cache_dir: Path = Field(
-        default=Path.home() / ".geoengine" / "cache",
-        description="Директорія кешу",
+    # ---- Cache ----
+    dem_cache_dir:  str = Field(
+        default="~/.geoengine/dem_cache",
+        description="DEM tile cache directory",
     )
-    data_dir: Path = Field(
-        default=Path("./data"),
-        description="Директорія даних",
+    osm_cache_dir:  str = Field(
+        default="~/.geoengine/osm_cache",
+        description="OSM cache directory",
+    )
+    redis_url:      str = Field(
+        default="redis://localhost:6379/0",
+        description="Redis URL",
     )
 
-    # ---- DEM API ключі ----
-    dem_api_keys: dict[str, str] = Field(
+    # ---- API Keys ----
+    dem_api_keys:   dict[str, str] = Field(
         default_factory=dict,
-        description=(
-            "API ключі для DEM джерел.\n"
-            "Формат: {source_id: api_key}\n"
-            "Наприклад: {'copernicus25': 'your_key'}"
-        ),
+        description="DEM source API keys {source: key}",
     )
 
-    # ---- Продуктивність ----
-    max_workers: int = Field(
-        default=4,
-        ge=1,
-        le=32,
-        description="Максимальна кількість воркерів ThreadPool",
+    # ---- CORS ----
+    cors_origins:   list[str] = Field(
+        default=["http://localhost:3000"],
+        description="Allowed CORS origins",
     )
 
-    @field_validator("cache_dir", "data_dir", mode="before")
-    @classmethod
-    def expand_and_create(cls, v: Any) -> Path:
-        """Розгортаємо ~ та створюємо директорію якщо не існує."""
-        path = Path(v).expanduser().resolve()
-        path.mkdir(parents=True, exist_ok=True)
-        return path
+    # ---- Workers ----
+    terrain_workers:  int = Field(default=4)
+    analysis_workers: int = Field(default=2)
 
     @field_validator("dem_api_keys", mode="before")
     @classmethod
     def parse_api_keys(cls, v: Any) -> dict[str, str]:
-        """Підтримує JSON рядок або dict."""
         if isinstance(v, str):
-            import json
             try:
                 return json.loads(v)
             except json.JSONDecodeError:
                 return {}
         return v or {}
 
-    @field_validator("log_level", mode="before")
+    @field_validator("cors_origins", mode="before")
     @classmethod
-    def uppercase_level(cls, v: Any) -> str:
-        return str(v).upper()
+    def parse_cors(cls, v: Any) -> list[str]:
+        if isinstance(v, str):
+            try:
+                return json.loads(v)
+            except json.JSONDecodeError:
+                return [v]
+        return v or ["http://localhost:3000"]
 
-    def setup_logging(self) -> None:
-        """Ініціалізувати логування з цією конфігурацією."""
-        from .logging import configure_logging
-        configure_logging(
-            level=self.log_level,
-            json_output=self.json_logs,
-        )
+    @property
+    def dem_cache_path(self) -> Path:
+        return Path(self.dem_cache_dir).expanduser()
 
-    def dem_cache_dir(self, source: str = "") -> Path:
-        """Директорія кешу для конкретного DEM джерела."""
-        path = self.cache_dir / "dem" / source if source else self.cache_dir / "dem"
-        path.mkdir(parents=True, exist_ok=True)
-        return path
-
-    def tile_cache_dir(self) -> Path:
-        """Директорія кешу тайлів."""
-        path = self.cache_dir / "tiles"
-        path.mkdir(parents=True, exist_ok=True)
-        return path
-
-    def mesh_cache_dir(self) -> Path:
-        """Директорія кешу мешів."""
-        path = self.cache_dir / "meshes"
-        path.mkdir(parents=True, exist_ok=True)
-        return path
-
-
-# ---- Глобальна конфігурація (lazy singleton) ----
-
-_config: BaseGeoConfig | None = None
-
-def get_config() -> BaseGeoConfig:
-    """Отримати глобальну конфігурацію (singleton)."""
-    global _config
-    if _config is None:
-        _config = BaseGeoConfig()
-    return _config
+    @property
+    def osm_cache_path(self) -> Path:
+        return Path(self.osm_cache_dir).expanduser()
