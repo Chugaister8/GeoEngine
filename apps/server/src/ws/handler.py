@@ -1,16 +1,12 @@
 """
 GeoEngine — WebSocket Handler
-Обробка WebSocket з'єднань та повідомлень.
+Обробка WS з'єднань та диспетчеризація повідомлень.
 
 Архітектура:
-  ConnectionManager — реєструє/видаляє з'єднання, broadcast
-  WSHandler         — обробляє повідомлення одного з'єднання
-  TaskQueue         — черга важких задач (DEM fetch, mesh build)
-
-Кожне з'єднання отримує:
-  - Унікальний connection_id
-  - Власний стан (підписки, кеш, rate limiter)
-  - Чергу відповідей (щоб не блокувати event loop)
+  ConnectionManager  — реєстр активних з'єднань
+  RateLimiter        — token bucket per connection
+  WSHandler          — диспетчер повідомлень (match/case)
+  websocket_endpoint — FastAPI WebSocket endpoint
 """
 
 from __future__ import annotations
@@ -19,95 +15,75 @@ import asyncio
 import json
 import time
 import uuid
-from dataclasses import dataclass, field
+from collections import defaultdict
 from typing import Any
 
 import structlog
 from fastapi import WebSocket, WebSocketDisconnect
-from pydantic import ValidationError
-from starlette.websockets import WebSocketState
 
 from .protocol import (
-    ClientMessage,
-    ErrorCode,
-    MessageType,
-    PingMessage,
-    PongMessage,
-    RequestAnalysisMessage,
-    RequestTileMessage,
-    ResponseTileMessage,
-    ResponseTilePayload,
-    TileBuffers,
-    TileOrigin,
-    ServerMessage,
+    WSClientMessage, WSRequestTile, WSRequestAnalysis,
+    WSCameraUpdate, WSPing,
     parse_client_message,
-    make_error,
+    make_pong, make_error, make_connected,
+    WSError,
 )
-from ..config import settings
 
 log: structlog.BoundLogger = structlog.get_logger(__name__)
 
+# ----------------------------------------------------------------
+# ERROR CODES
+# ----------------------------------------------------------------
+
+WS_ERRORS = {
+    "INVALID_MESSAGE":   1001,
+    "INVALID_TILE":      1002,
+    "SOURCE_NOT_FOUND":  1003,
+    "PROCESSING_FAILED": 1004,
+    "RATE_LIMITED":      4001,
+    "SERVER_ERROR":      5000,
+}
 
 # ----------------------------------------------------------------
-# RATE LIMITER
+# RATE LIMITER (Token Bucket)
 # ----------------------------------------------------------------
 
-@dataclass
 class RateLimiter:
     """
-    Простий token bucket rate limiter для одного з'єднання.
-
-    Запобігає спаму запитами тайлів (DEM fetch дорогий).
+    Token bucket rate limiter per connection.
+    Дозволяє burst запитів але обмежує середній rate.
     """
-    max_tokens:    float = 20.0    # максимальний burst
-    refill_rate:   float = 5.0     # токенів/секунду
-    _tokens:       float = field(init=False)
-    _last_refill:  float = field(init=False)
 
-    def __post_init__(self) -> None:
-        self._tokens      = self.max_tokens
-        self._last_refill = time.monotonic()
+    def __init__(
+        self,
+        rate:     float = 10.0,   # запитів/секунду
+        capacity: float = 20.0,   # максимальний burst
+    ) -> None:
+        self._rate     = rate
+        self._capacity = capacity
+        self._tokens:  dict[str, float] = defaultdict(lambda: capacity)
+        self._last:    dict[str, float] = defaultdict(time.monotonic)
 
-    def consume(self, count: float = 1.0) -> bool:
-        """
-        Спробувати витратити count токенів.
+    def allow(self, conn_id: str) -> bool:
+        """Чи дозволений запит для conn_id?"""
+        now     = time.monotonic()
+        elapsed = now - self._last[conn_id]
+        self._last[conn_id] = now
 
-        Returns:
-            True якщо дозволено, False якщо rate limit перевищено.
-        """
-        now = time.monotonic()
-        elapsed = now - self._last_refill
-
-        # Поповнити токени
-        self._tokens = min(
-            self.max_tokens,
-            self._tokens + elapsed * self.refill_rate,
+        # Поповнити токени за час що минув
+        self._tokens[conn_id] = min(
+            self._capacity,
+            self._tokens[conn_id] + elapsed * self._rate,
         )
-        self._last_refill = now
 
-        if self._tokens >= count:
-            self._tokens -= count
+        if self._tokens[conn_id] >= 1.0:
+            self._tokens[conn_id] -= 1.0
             return True
         return False
 
-
-# ----------------------------------------------------------------
-# СТАН З'ЄДНАННЯ
-# ----------------------------------------------------------------
-
-@dataclass
-class ConnectionState:
-    """Стан одного WebSocket з'єднання."""
-    connection_id: str
-    connected_at:  float = field(default_factory=time.monotonic)
-    rate_limiter:  RateLimiter = field(default_factory=RateLimiter)
-    subscriptions: set[str] = field(default_factory=set)
-    request_count: int = 0
-    error_count:   int = 0
-
-    @property
-    def age_s(self) -> float:
-        return time.monotonic() - self.connected_at
+    def remove(self, conn_id: str) -> None:
+        self._tokens.pop(conn_id, None)
+        self._last.pop(conn_id, None)
 
 
 # ----------------------------------------------------------------
@@ -115,103 +91,54 @@ class ConnectionState:
 # ----------------------------------------------------------------
 
 class ConnectionManager:
-    """
-    Менеджер всіх активних WebSocket з'єднань.
-
-    Thread-safe через asyncio.Lock.
-    Singleton — один на весь FastAPI застосунок.
-    """
+    """Реєстр активних WebSocket з'єднань."""
 
     def __init__(self) -> None:
         self._connections: dict[str, WebSocket] = {}
-        self._states:      dict[str, ConnectionState] = {}
-        self._lock = asyncio.Lock()
 
-    async def connect(self, ws: WebSocket) -> str:
-        """
-        Прийняти нове з'єднання.
+    async def connect(self, websocket: WebSocket) -> str:
+        """Прийняти нове з'єднання. Повертає session_id."""
+        await websocket.accept()
+        session_id = str(uuid.uuid4())
+        self._connections[session_id] = websocket
+        log.info("ws.connect", session_id=session_id[:8],
+                 total=len(self._connections))
+        return session_id
 
-        Returns:
-            connection_id — унікальний ідентифікатор з'єднання
-        """
-        await ws.accept()
-        conn_id = str(uuid.uuid4())
+    def disconnect(self, session_id: str) -> None:
+        self._connections.pop(session_id, None)
+        log.info("ws.disconnect", session_id=session_id[:8],
+                 total=len(self._connections))
 
-        async with self._lock:
-            self._connections[conn_id] = ws
-            self._states[conn_id] = ConnectionState(connection_id=conn_id)
-
-        log.info(
-            "ws.connect",
-            conn_id=conn_id[:8],
-            total=len(self._connections),
-        )
-        return conn_id
-
-    async def disconnect(self, conn_id: str) -> None:
-        """Закрити та видалити з'єднання."""
-        async with self._lock:
-            self._connections.pop(conn_id, None)
-            state = self._states.pop(conn_id, None)
-
-        if state:
-            log.info(
-                "ws.disconnect",
-                conn_id=conn_id[:8],
-                age_s=f"{state.age_s:.1f}",
-                requests=state.request_count,
-            )
-
-    async def send(self, conn_id: str, message: ServerMessage) -> bool:
-        """
-        Відправити повідомлення конкретному з'єднанню.
-
-        Returns:
-            True якщо успішно, False якщо з'єднання вже закрите.
-        """
-        ws = self._connections.get(conn_id)
+    async def send(self, session_id: str, data: dict) -> bool:
+        """Відправити повідомлення конкретному клієнту."""
+        ws = self._connections.get(session_id)
         if ws is None:
             return False
-
         try:
-            await ws.send_text(message.model_dump_json())
+            await ws.send_json(data)
             return True
         except Exception as exc:
-            log.warning(
-                "ws.send.error",
-                conn_id=conn_id[:8],
-                error=str(exc),
-            )
-            await self.disconnect(conn_id)
+            log.warning("ws.send_error", session_id=session_id[:8],
+                        error=str(exc)[:80])
             return False
 
-    async def broadcast(self, message: ServerMessage) -> int:
-        """
-        Відправити повідомлення всім з'єднанням.
-
-        Returns:
-            Кількість успішно отриманих з'єднань.
-        """
-        if not self._connections:
-            return 0
-
-        conn_ids = list(self._connections.keys())
-        results  = await asyncio.gather(
-            *[self.send(cid, message) for cid in conn_ids],
-            return_exceptions=True,
-        )
-        return sum(1 for r in results if r is True)
-
-    def get_state(self, conn_id: str) -> ConnectionState | None:
-        return self._states.get(conn_id)
+    async def broadcast(self, data: dict) -> int:
+        """Broadcast всім клієнтам. Повертає кількість успішних."""
+        sent = 0
+        for sid in list(self._connections.keys()):
+            if await self.send(sid, data):
+                sent += 1
+        return sent
 
     @property
-    def connection_count(self) -> int:
+    def count(self) -> int:
         return len(self._connections)
 
 
-# Глобальний singleton
-manager = ConnectionManager()
+# ---- Глобальні інстанси ----
+manager     = ConnectionManager()
+rate_limiter = RateLimiter(rate=10.0, capacity=20.0)
 
 
 # ----------------------------------------------------------------
@@ -220,273 +147,252 @@ manager = ConnectionManager()
 
 class WSHandler:
     """
-    Обробник повідомлень одного WebSocket з'єднання.
-
-    Патерн: Command — кожен тип повідомлення → окремий метод.
-
-    Важкі операції (DEM fetch, mesh build) виконуються
-    в ThreadPoolExecutor щоб не блокувати event loop.
+    Диспетчер WebSocket повідомлень.
+    Використовує match/case для маршрутизації типів.
     """
 
-    def __init__(self, conn_id: str) -> None:
-        self._conn_id  = conn_id
-        self._log      = log.bind(conn_id=conn_id[:8])
+    def __init__(
+        self,
+        session_id:      str,
+        terrain_service: Any,
+        analysis_service: Any,
+    ) -> None:
+        self._sid             = session_id
+        self._terrain_svc     = terrain_service
+        self._analysis_svc    = analysis_service
 
-        # Імпортуємо тут щоб уникнути циклічних залежностей
-        from ..services.terrain import TerrainService
-        from ..services.analysis import AnalysisService
-        self._terrain  = TerrainService()
-        self._analysis = AnalysisService()
-
-    async def handle(self, raw: str | bytes) -> ServerMessage | None:
+    async def handle(self, raw: str) -> dict | None:
         """
-        Обробити одне повідомлення від клієнта.
-
-        Args:
-            raw: JSON рядок або bytes
-
-        Returns:
-            Відповідь або None (якщо відповідь вже відправлена асинхронно)
+        Обробити одне WS повідомлення.
+        Повертає відповідь або None (якщо немає відповіді).
         """
-        state = manager.get_state(self._conn_id)
-        if state is None:
-            return None
-
-        state.request_count += 1
-
-        # Парсинг
+        # 1. Парсинг JSON
         try:
-            message = parse_client_message(raw)
-        except (ValidationError, ValueError, json.JSONDecodeError) as exc:
-            state.error_count += 1
-            self._log.warning(
-                "ws.parse_error",
-                error=str(exc)[:200],
-            )
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            log.debug("ws.parse_error", error=str(exc)[:60])
             return make_error(
-                code=ErrorCode.INVALID_PAYLOAD,
-                message=f"Невалідний формат повідомлення: {exc}",
+                WS_ERRORS["INVALID_MESSAGE"],
+                f"Invalid JSON: {exc}",
             )
 
-        self._log.debug("ws.message", type=message.type)
-
-        # Rate limiting
-        if not state.rate_limiter.consume():
+        # 2. Rate limiting
+        if not rate_limiter.allow(self._sid):
+            log.warning("ws.rate_limited", session_id=self._sid[:8])
             return make_error(
-                code=ErrorCode.RATE_LIMITED,
-                message="Занадто багато запитів. Зачекайте секунду.",
-                request_id=message.id,
+                WS_ERRORS["RATE_LIMITED"],
+                "Rate limit exceeded. Max 10 req/sec.",
+                request_id=data.get("id"),
             )
 
-        # Диспетчеризація
-        match message.type:
-            case MessageType.REQUEST_TILE:
-                return await self._handle_tile(message)   # type: ignore[arg-type]
-            case MessageType.REQUEST_ANALYSIS:
-                return await self._handle_analysis(message)  # type: ignore[arg-type]
-            case MessageType.PING:
-                return self._handle_ping(message)         # type: ignore[arg-type]
-            case MessageType.UNSUBSCRIBE:
-                return await self._handle_unsubscribe(message)
-            case _:
-                return make_error(
-                    code=ErrorCode.UNKNOWN_MESSAGE_TYPE,
-                    message=f"Невідомий тип повідомлення: {message.type}",
-                    request_id=message.id,
+        # 3. Парсинг типу повідомлення
+        msg = parse_client_message(data)
+        if msg is None:
+            return make_error(
+                WS_ERRORS["INVALID_MESSAGE"],
+                f"Unknown message type: {data.get('type', 'none')}",
+                request_id=data.get("id"),
+            )
+
+        # 4. Диспетчеризація
+        try:
+            return await self._dispatch(msg)
+        except Exception as exc:
+            log.error("ws.handler_error", error=str(exc), exc_info=True)
+            return make_error(
+                WS_ERRORS["SERVER_ERROR"],
+                "Internal server error",
+                request_id=msg.id,
+                details=str(exc)[:200],
+            )
+
+    async def _dispatch(self, msg: WSClientMessage) -> dict | None:
+        """Маршрутизація за типом повідомлення."""
+        match msg:
+
+            case WSPing():
+                recv_ts = time.time() * 1000
+                return make_pong(
+                    request_id=msg.id,
+                    latency_ms=recv_ts - msg.timestamp,
                 )
 
-    # ---- Обробники ----
+            case WSRequestTile():
+                return await self._handle_tile(msg)
 
-    async def _handle_tile(
-        self,
-        message: RequestTileMessage,
-    ) -> ResponseTileMessage | None:
-        """
-        Обробити запит тайлу.
+            case WSRequestAnalysis():
+                return await self._handle_analysis(msg)
 
-        Пайплайн:
-        1. Завантажити DEM (з кешу або мережі)
-        2. Побудувати TerrainMesh
-        3. Серіалізувати у base64 буфери
-        4. Повернути ResponseTileMessage
-        """
-        p    = message.payload
-        tile = p.tile
+            case WSCameraUpdate():
+                # Camera update — просто логуємо, не відповідаємо
+                log.debug(
+                    "ws.camera_update",
+                    lat=round(msg.payload.lat, 4),
+                    lon=round(msg.payload.lon, 4),
+                    alt=round(msg.payload.alt, 0),
+                )
+                return None
 
-        self._log.info(
-            "ws.tile.request",
-            tile=f"{tile.z}/{tile.x}/{tile.y}",
+            case _:
+                return make_error(
+                    WS_ERRORS["INVALID_MESSAGE"],
+                    f"Unhandled type: {msg.type}",
+                    request_id=msg.id,
+                )
+
+    async def _handle_tile(self, msg: WSRequestTile) -> dict:
+        """Обробити запит тайлу."""
+        p = msg.payload
+
+        log.debug(
+            "ws.tile_request",
+            tile=f"{p.tile.z}/{p.tile.x}/{p.tile.y}",
             source=p.source,
+            max_verts=p.max_vertices,
         )
 
+        t0 = time.perf_counter()
+
         try:
-            # Делегуємо TerrainService
-            mesh_data = await self._terrain.get_tile_mesh(
-                tile_x=tile.x,
-                tile_y=tile.y,
-                tile_z=tile.z,
-                source=str(p.source),
+            mesh_data = await self._terrain_svc.get_tile_mesh(
+                x=p.tile.x,
+                y=p.tile.y,
+                z=p.tile.z,
+                source=p.source,
                 max_vertices=p.max_vertices,
                 skirt_height_m=p.skirt_height_m,
             )
-
-        except Exception as exc:
-            self._log.error(
-                "ws.tile.error",
-                tile=f"{tile.z}/{tile.x}/{tile.y}",
-                error=str(exc),
-            )
-            return make_error(   # type: ignore[return-value]
-                code=ErrorCode.DEM_FETCH_FAILED,
-                message=f"Не вдалося отримати DEM: {exc}",
-                request_id=message.id,
-            )
-
-        response = ResponseTileMessage(
-            request_id=message.id,
-            payload=ResponseTilePayload(
-                lod_level=mesh_data["lod_level"],
-                vertex_count=mesh_data["vertex_count"],
-                triangle_count=mesh_data["triangle_count"],
-                bbox=mesh_data["bbox"],
-                origin=TileOrigin(**mesh_data["origin"]),
-                buffers=TileBuffers(**mesh_data["buffers"]),
-                min_elevation=mesh_data["min_elevation"],
-                max_elevation=mesh_data["max_elevation"],
-                source=mesh_data["source"],
-                resolution_m=mesh_data["resolution_m"],
-                memory_bytes=mesh_data["memory_bytes"],
-            ),
-        )
-
-        self._log.info(
-            "ws.tile.done",
-            tile=f"{tile.z}/{tile.x}/{tile.y}",
-            verts=mesh_data["vertex_count"],
-            tris=mesh_data["triangle_count"],
-        )
-
-        return response
-
-    async def _handle_analysis(
-        self,
-        message: RequestAnalysisMessage,
-    ) -> ServerMessage:
-        """Обробити запит аналізу."""
-        from ..services.analysis import AnalysisService
-        from .protocol import AnalysisResultMessage, AnalysisResultPayload
-
-        p = message.payload
-        self._log.info(
-            "ws.analysis.request",
-            analyses=p.analyses,
-            bbox=f"{p.bbox.west:.2f},{p.bbox.south:.2f},{p.bbox.east:.2f},{p.bbox.north:.2f}",
-        )
-
-        try:
-            result = await self._analysis.run(
-                bbox_west=p.bbox.west,
-                bbox_south=p.bbox.south,
-                bbox_east=p.bbox.east,
-                bbox_north=p.bbox.north,
-                analyses=list(p.analyses),
-                params={
-                    "contour_interval_m": p.contour_interval_m,
-                    "viewshed_observer":  p.viewshed_observer,
-                    "viewshed_radius_m":  p.viewshed_radius_m,
-                    "flood_level_m":      p.flood_level_m,
-                    "hillshade_azimuth":  p.hillshade_azimuth,
-                    "hillshade_altitude": p.hillshade_altitude,
-                },
-            )
-        except Exception as exc:
-            self._log.error("ws.analysis.error", error=str(exc))
+        except ValueError as exc:
             return make_error(
-                code=ErrorCode.ANALYSIS_FAILED,
-                message=f"Аналіз не вдався: {exc}",
-                request_id=message.id,
+                WS_ERRORS["INVALID_TILE"],
+                str(exc),
+                request_id=msg.id,
+            )
+        except Exception as exc:
+            log.error("ws.tile_error",
+                      tile=f"{p.tile.z}/{p.tile.x}/{p.tile.y}",
+                      error=str(exc))
+            return make_error(
+                WS_ERRORS["PROCESSING_FAILED"],
+                "Failed to generate terrain mesh",
+                request_id=msg.id,
+                details=str(exc)[:200],
             )
 
-        return AnalysisResultMessage(
-            request_id=message.id,
-            payload=AnalysisResultPayload(**result),
+        elapsed = (time.perf_counter() - t0) * 1000
+        log.info(
+            "ws.tile_response",
+            tile=f"{p.tile.z}/{p.tile.x}/{p.tile.y}",
+            verts=mesh_data.get("vertex_count", 0),
+            ms=round(elapsed, 1),
         )
 
-    def _handle_ping(self, message: PingMessage) -> PongMessage:
-        """Відповісти на ping."""
-        return PongMessage(payload={"latency_hint": int(time.time() * 1000)})
+        return {
+            "type":       "response_tile",
+            "id":         str(uuid.uuid4()),
+            "timestamp":  time.time() * 1000,
+            "request_id": msg.id,
+            "payload":    mesh_data,
+        }
 
-    async def _handle_unsubscribe(self, message: Any) -> PongMessage:
-        """Відписатися від стріму."""
-        state = manager.get_state(self._conn_id)
-        if state:
-            stream_id = message.payload.get("stream_id", "")
-            state.subscriptions.discard(stream_id)
-        return PongMessage()
+    async def _handle_analysis(self, msg: WSRequestAnalysis) -> dict:
+        """Обробити запит аналізу."""
+        p = msg.payload
+
+        log.debug(
+            "ws.analysis_request",
+            analyses=p.analyses,
+            bbox=str(p.bbox),
+        )
+
+        results = []
+        for analysis_type in p.analyses:
+            try:
+                result = await self._analysis_svc.compute(
+                    bbox=p.bbox,
+                    analysis_type=analysis_type,
+                    source=p.source,
+                    options=p.options,
+                )
+                results.append(result)
+            except Exception as exc:
+                log.warning(
+                    "ws.analysis_error",
+                    type=analysis_type,
+                    error=str(exc)[:80],
+                )
+
+        if not results:
+            return make_error(
+                WS_ERRORS["PROCESSING_FAILED"],
+                "All analyses failed",
+                request_id=msg.id,
+            )
+
+        return {
+            "type":       "analysis_result",
+            "id":         str(uuid.uuid4()),
+            "timestamp":  time.time() * 1000,
+            "request_id": msg.id,
+            "payload": {
+                "results": results,
+                "bbox":    p.bbox.model_dump(),
+            },
+        }
 
 
 # ----------------------------------------------------------------
 # FASTAPI ENDPOINT
 # ----------------------------------------------------------------
 
-async def websocket_endpoint(ws: WebSocket) -> None:
+async def websocket_endpoint(
+    websocket:        WebSocket,
+    terrain_service:  Any,
+    analysis_service: Any,
+) -> None:
     """
     FastAPI WebSocket endpoint.
 
-    Підключити до роутера:
-        router.add_api_websocket_route("/ws", websocket_endpoint)
-
     Lifecycle:
-        connect → receive loop → disconnect (clean або exception)
+      connect → send connected → recv loop → disconnect
     """
-    conn_id = await manager.connect(ws)
-    handler = WSHandler(conn_id)
-    bound_log = log.bind(conn_id=conn_id[:8])
+    session_id = await manager.connect(websocket)
+
+    # Відправити connected повідомлення
+    await websocket.send_json(make_connected(session_id))
+
+    handler = WSHandler(
+        session_id=session_id,
+        terrain_service=terrain_service,
+        analysis_service=analysis_service,
+    )
 
     try:
         while True:
-            # Перевірка стану
-            if ws.client_state != WebSocketState.CONNECTED:
-                break
-
-            # Отримати повідомлення з таймаутом (keepalive)
             try:
                 raw = await asyncio.wait_for(
-                    ws.receive_text(),
-                    timeout=settings.ws_timeout_s,
+                    websocket.receive_text(),
+                    timeout=120.0,   # 2 хвилини timeout
                 )
             except asyncio.TimeoutError:
-                # Клієнт не надсилав нічого — відправляємо ping
-                try:
-                    await ws.send_text(
-                        PongMessage(payload={"type": "keepalive"}).model_dump_json()
-                    )
-                except Exception:
-                    break
+                # Ping для перевірки чи жива сесія
+                await websocket.send_json({"type": "ping", "id": "server-keepalive", "timestamp": time.time()*1000, "payload": {}})
                 continue
 
-            # Обробка повідомлення
             response = await handler.handle(raw)
-
-            # Відправка відповіді
             if response is not None:
-                sent = await manager.send(conn_id, response)
-                if not sent:
-                    break
+                await websocket.send_json(response)
 
     except WebSocketDisconnect:
-        bound_log.info("ws.client_disconnect")
+        log.info("ws.client_disconnected", session_id=session_id[:8])
     except Exception as exc:
-        bound_log.error("ws.unexpected_error", error=str(exc))
+        log.error("ws.error", session_id=session_id[:8], error=str(exc))
         try:
-            await manager.send(
-                conn_id,
-                make_error(
-                    code=ErrorCode.INTERNAL_ERROR,
-                    message="Внутрішня помилка сервера",
-                ),
+            await websocket.send_json(
+                make_error(WS_ERRORS["SERVER_ERROR"], str(exc)[:200])
             )
         except Exception:
             pass
     finally:
-        await manager.disconnect(conn_id)
+        manager.disconnect(session_id)
+        rate_limiter.remove(session_id)
