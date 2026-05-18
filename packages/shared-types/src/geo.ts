@@ -1,243 +1,360 @@
-// ============================================================
-// GeoEngine — Shared Geo Types
-// Базові геопросторові типи, спільні для Python↔JS протоколу
-// ============================================================
+/**
+ * GeoEngine — Shared TypeScript Types
+ * Типи що розділяються між core-js, viewer та server протоколом.
+ *
+ * Цей файл є єдиним джерелом правди для:
+ * - Географічних примітивів (BBox, TileXYZ, LatLon)
+ * - WebSocket протоколу (запити/відповіді)
+ * - LOD конфігурації
+ * - CRS кодів та DEM джерел
+ */
 
-// ------------------------------------------------------------
-// КООРДИНАТИ
-// ------------------------------------------------------------
+// ================================================================
+// ГЕОГРАФІЧНІ ПРИМІТИВИ
+// ================================================================
 
-/** Географічна точка у системі WGS84 (EPSG:4326) */
 export interface LatLon {
-  readonly lat: number  // -90..90
-  readonly lon: number  // -180..180
+  lat: number
+  lon: number
 }
 
-/** LatLon + висота над рівнем моря (метри) */
 export interface LatLonAlt extends LatLon {
-  readonly alt: number
+  alt: number
 }
 
-/** 2D точка у локальній/екранній системі координат */
-export interface Vec2 {
-  readonly x: number
-  readonly y: number
-}
-
-/** 3D точка у світовій системі координат рушія */
-export interface Vec3 {
-  readonly x: number
-  readonly y: number
-  readonly z: number
-}
-
-/** Quaternion для обертань */
-export interface Quat {
-  readonly x: number
-  readonly y: number
-  readonly z: number
-  readonly w: number
-}
-
-/** 4×4 матриця (column-major, як у WebGPU/GLSL) */
-export type Mat4 = readonly [
-  number, number, number, number,
-  number, number, number, number,
-  number, number, number, number,
-  number, number, number, number,
-]
-
-// ------------------------------------------------------------
-// BOUNDING BOX
-// ------------------------------------------------------------
-
-/**
- * Географічний обмежуючий прямокутник (WGS84)
- * Конвенція: west < east, south < north
- * Антимеридіан: west може бути > east (наприклад, 170..-170)
- */
 export interface BBox {
-  readonly west:  number   // мін. longitude
-  readonly south: number   // мін. latitude
-  readonly east:  number   // макс. longitude
-  readonly north: number   // макс. latitude
+  west:  number
+  south: number
+  east:  number
+  north: number
 }
 
-/** BBox з висотами */
-export interface BBox3D extends BBox {
-  readonly minAlt: number  // метри
-  readonly maxAlt: number  // метри
-}
-
-// ------------------------------------------------------------
-// TILE ADDRESSING
-// ------------------------------------------------------------
-
-/**
- * Адреса тайлу у схемі XYZ (Slippy Map / WebMercator)
- * z=0: весь світ в 1 тайлі
- * z=1: 4 тайли
- * z=N: 4^N тайлів
- */
 export interface TileXYZ {
-  readonly x: number
-  readonly y: number
-  readonly z: number  // zoom рівень (0-22)
+  x: number
+  y: number
+  z: number
 }
 
-/** Тип тайлової схеми */
-export type TileScheme = 'xyz' | 'tms' | 'quadkey'
-
-// ------------------------------------------------------------
-// ПРОЕКЦІЇ / CRS
-// ------------------------------------------------------------
-
-/**
- * Ідентифікатор системи координат
- * Підтримуємо: EPSG коди та іменовані псевдоніми
- */
-export type CRSCode =
-  | 'WGS84'          // EPSG:4326 — GPS стандарт
-  | 'WebMercator'    // EPSG:3857 — веб-карти
-  | 'ECEF'           // Earth-Centered Earth-Fixed (3D глобус)
-  | `EPSG:${number}` // Будь-який EPSG (UTM, Lambert, тощо)
-
-/** Точка у довільній системі координат */
-export interface ProjectedPoint {
-  readonly x: number
-  readonly y: number
-  readonly crs: CRSCode
+export interface Vec3 {
+  x: number
+  y: number
+  z: number
 }
 
-// ------------------------------------------------------------
-// RESOLUTION / LOD
-// ------------------------------------------------------------
+export interface Vec2 {
+  x: number
+  y: number
+}
 
-/** Рівень деталізації (Level of Detail) */
+// ================================================================
+// LOD
+// ================================================================
+
 export type LODLevel = 0 | 1 | 2 | 3 | 4 | 5
 
-/**
- * Роздільна здатність у метрах на піксель
- * LOD0 ≈ 0.5–1m, LOD1 ≈ 5–10m, ..., LOD5 ≈ 5–10km
- */
-export interface Resolution {
-  readonly metersPerPixel: number
-  readonly lod: LODLevel
+export interface LODConfig {
+  level:        LODLevel
+  minZoom:      number
+  maxZoom:      number
+  maxVertices:  number
+  distanceM:    number   // відстань камери при якій активується
+  morphRange:   number   // діапазон morph transition (метри)
 }
 
-// ------------------------------------------------------------
-// ELEVATION DATA
-// ------------------------------------------------------------
+export const DEFAULT_LOD_LEVELS: LODLevel[] = [0, 1, 2, 3, 4, 5]
 
-/** Метадані одного тайлу висот */
-export interface ElevationTileMeta {
-  readonly tile:        TileXYZ
-  readonly bbox:        BBox
-  readonly resolution:  number        // м/піксель
-  readonly minElevation: number       // метри
-  readonly maxElevation: number       // метри
-  readonly noDataValue:  number       // зазвичай -9999
-  readonly source:       DEMSource
-}
+// ================================================================
+// CRS ТА DEM ДЖЕРЕЛА
+// ================================================================
 
-/** Джерело даних висот */
+export type CRSCode =
+  | "EPSG:4326"    // WGS84 geographic
+  | "EPSG:3857"    // Web Mercator
+  | "EPSG:32636"   // UTM zone 36N (Ukraine)
+  | "EPSG:32637"   // UTM zone 37N
+  | string
+
 export type DEMSource =
-  | 'srtm30'        // NASA SRTM 30m
-  | 'copernicus25'  // ESA Copernicus 25m
-  | 'usgs1m'        // USGS 3DEP 1m
-  | 'custom'        // Користувацький GeoTIFF
+  | "copernicus25"
+  | "srtm30"
+  | "terrarium"
+  | "usgs1m"
+  | string
 
-// ------------------------------------------------------------
-// CAMERA
-// ------------------------------------------------------------
+// ================================================================
+// CAMERA STATE
+// ================================================================
 
-/** Стан камери */
 export interface CameraState {
-  readonly position:   LatLonAlt
-  readonly target:     LatLon
-  readonly heading:    number    // градуси від Півночі (0-360)
-  readonly pitch:      number    // нахил (-90 вниз, +90 вгору)
-  readonly fov:        number    // field of view (градуси)
-  readonly near:       number    // near clip plane (метри)
-  readonly far:        number    // far clip plane  (метри)
+  lat:     number
+  lon:     number
+  alt:     number    // метри
+  heading: number    // градуси від Півночі [0..360)
+  pitch:   number    // градуси [-90..90]
+  fov:     number    // degrees
+  near:    number    // метри
+  far:     number    // метри
 }
 
-// ------------------------------------------------------------
-// WEBSOCKET PROTOCOL (Python ↔ JS)
-// ------------------------------------------------------------
+// ================================================================
+// WEBSOCKET ПРОТОКОЛ
+// ================================================================
 
-/** Базовий тип повідомлення по WebSocket */
-export interface WSMessage<T extends string, P = unknown> {
-  readonly type:      T
-  readonly id:        string     // UUID запиту
-  readonly timestamp: number     // Unix ms
-  readonly payload:   P
+// ---- Базові типи ----
+
+export type WSMessageType =
+  | "ping"
+  | "pong"
+  | "request_tile"
+  | "response_tile"
+  | "request_analysis"
+  | "analysis_result"
+  | "camera_update"
+  | "scene_update"
+  | "error"
+  | "connected"
+  | "disconnected"
+
+export interface WSBaseMessage {
+  type:      WSMessageType
+  id:        string       // UUID запиту
+  timestamp: number       // Unix мс
 }
 
-/** Запит тайлу висот */
-export type WSRequestTile = WSMessage<'request_tile', {
-  tile:   TileXYZ
-  source: DEMSource
-}>
+// ---- Client → Server ----
 
-/** Відповідь з тайлом (base64 float32 array) */
-export type WSResponseTile = WSMessage<'response_tile', {
-  tile:    TileXYZ
-  width:   number
-  height:  number
-  data:    string    // base64(Float32Array) висоти в метрах
-  meta:    ElevationTileMeta
-}>
+export interface WSPing extends WSBaseMessage {
+  type:    "ping"
+  payload: Record<string, never>
+}
 
-/** Помилка */
-export type WSError = WSMessage<'error', {
-  code:    number
-  message: string
-  detail?: unknown
-}>
+export interface WSRequestTile extends WSBaseMessage {
+  type: "request_tile"
+  payload: {
+    tile:            TileXYZ
+    source:          DEMSource
+    max_vertices?:   number      // default 65536
+    skirt_height_m?: number      // default 200
+    lod_level?:      LODLevel
+  }
+}
 
-/** Union всіх серверних повідомлень */
-export type WSServerMessage = WSResponseTile | WSError
+export interface WSRequestAnalysis extends WSBaseMessage {
+  type: "request_analysis"
+  payload: {
+    bbox:      BBox
+    analyses:  AnalysisType[]
+    source?:   DEMSource
+    options?:  AnalysisOptions
+  }
+}
 
-/** Union всіх клієнтських повідомлень */
-export type WSClientMessage = WSRequestTile
+export interface WSCameraUpdate extends WSBaseMessage {
+  type: "camera_update"
+  payload: CameraState
+}
 
-// ------------------------------------------------------------
-// UTILITY TYPES
-// ------------------------------------------------------------
+// ---- Server → Client ----
 
-/** Результат операції — або значення або помилка */
-export type Result<T, E = Error> =
-  | { readonly ok: true;  readonly value: T }
-  | { readonly ok: false; readonly error: E }
+export interface WSPong extends WSBaseMessage {
+  type:       "pong"
+  request_id: string
+  payload:    { latency_ms?: number }
+}
 
-/** Mutable версія readonly типу */
-export type Mutable<T> = { -readonly [P in keyof T]: T[P] }
+export interface TerrainMeshBuffers {
+  vertices: string    // base64 Float32Array (N×3)
+  indices:  string    // base64 Uint32Array  (M×3)
+  uvs:      string    // base64 Float32Array (N×2)
+  normals:  string    // base64 Float32Array (N×3)
+}
 
-// ------------------------------------------------------------
-// CONSTANTS (як const об'єкт, не enum)
-// ------------------------------------------------------------
+export interface WSResponseTile extends WSBaseMessage {
+  type:       "response_tile"
+  request_id: string
+  payload: {
+    tile:           TileXYZ
+    lod_level:      LODLevel
+    vertex_count:   number
+    triangle_count: number
+    memory_bytes:   number
+    bbox:           BBox
+    origin: {
+      lat: number
+      lon: number
+      alt: number
+    }
+    min_elevation:  number
+    max_elevation:  number
+    source:         DEMSource
+    buffers:        TerrainMeshBuffers
+    // Опційно: normal map
+    normal_map?: {
+      data:   string   // base64 uint8 (H×W×3)
+      width:  number
+      height: number
+    }
+  }
+}
 
-export const GEO = {
-  /** Радіус Землі (метри, середній) */
-  EARTH_RADIUS_M: 6_371_000,
+export interface WSAnalysisResult extends WSBaseMessage {
+  type:       "analysis_result"
+  request_id: string
+  payload: {
+    analysis_type: AnalysisType
+    result_type:   "raster" | "vector" | "profile"
+    bbox:          BBox
+    // Для raster
+    data?:    string    // base64 Float32Array
+    width?:   number
+    height?:  number
+    min_val?: number
+    max_val?: number
+    // Для vector (GeoJSON)
+    geojson?: object
+    // Для profile
+    profile?: ElevationProfile
+  }
+}
 
-  /** WGS84 велика піввісь */
-  WGS84_A: 6_378_137.0,
+export interface WSError extends WSBaseMessage {
+  type:       "error"
+  request_id?: string
+  payload: {
+    code:     number
+    message:  string
+    details?: string
+  }
+}
 
-  /** WGS84 мала піввісь */
-  WGS84_B: 6_356_752.314245,
+export interface WSConnected extends WSBaseMessage {
+  type: "connected"
+  payload: {
+    session_id:    string
+    server_version: string
+    capabilities:  string[]
+  }
+}
 
-  /** WGS84 стиснення */
-  WGS84_F: 1 / 298.257223563,
+// ---- Union types ----
 
-  /** Градусів у радіані */
-  DEG_TO_RAD: Math.PI / 180,
-  RAD_TO_DEG: 180 / Math.PI,
+export type WSClientMessage =
+  | WSPing
+  | WSRequestTile
+  | WSRequestAnalysis
+  | WSCameraUpdate
 
-  /** Розмір тайлу за замовчуванням (пікселів) */
-  DEFAULT_TILE_SIZE: 256,
+export type WSServerMessage =
+  | WSPong
+  | WSResponseTile
+  | WSAnalysisResult
+  | WSError
+  | WSConnected
 
-  /** Максимальний WebMercator zoom */
-  MAX_ZOOM: 22,
+// ================================================================
+// ANALYSIS TYPES
+// ================================================================
+
+export type AnalysisType =
+  | "slope"
+  | "aspect"
+  | "hillshade"
+  | "contours"
+  | "viewshed"
+  | "profile"
+  | "flood"
+
+export interface AnalysisOptions {
+  // Slope / Aspect
+  z_factor?:       number
+  // Hillshade
+  azimuth?:        number    // degrees [0..360]
+  altitude?:       number    // degrees [0..90]
+  // Contours
+  interval?:       number    // метри
+  base?:           number
+  // Viewshed
+  observer_height?: number   // метри над рельєфом
+  max_distance?:   number    // метри
+  // Profile
+  n_points?:       number
+}
+
+export interface ElevationProfile {
+  distances:  number[]    // метри від початку
+  elevations: number[]    // метри
+  lats:       number[]
+  lons:       number[]
+  total_length_m: number
+  min_elevation:  number
+  max_elevation:  number
+}
+
+// ================================================================
+// SCENE TYPES
+// ================================================================
+
+export interface SceneLayerInfo {
+  id:           string
+  name:         string
+  visible:      boolean
+  opacity:      number
+  render_order: number
+  node_count:   number
+}
+
+export interface SceneInfo {
+  name:        string
+  origin:      LatLonAlt
+  camera:      CameraState
+  layers:      SceneLayerInfo[]
+  node_count:  number
+  bbox?:       BBox
+  time_of_day: number
+}
+
+// ================================================================
+// RENDERER TYPES
+// ================================================================
+
+export type RendererMode = "webgpu" | "webgl2"
+
+export interface QuadtreeStats {
+  total:    number
+  leaves:   number
+  culled:   number
+  maxDepth: number
+}
+
+export interface RenderStats {
+  fps:          number
+  frameTime:    number
+  visibleTiles: number
+  totalTiles:   number
+  triangles:    number
+  drawCalls:    number
+  quadtree:     QuadtreeStats
+}
+
+export type RendererState =
+  | "idle"
+  | "initializing"
+  | "running"
+  | "paused"
+  | "error"
+
+// ================================================================
+// ERROR CODES
+// ================================================================
+
+export const WS_ERROR_CODES = {
+  INVALID_MESSAGE:    1001,
+  INVALID_TILE:       1002,
+  SOURCE_NOT_FOUND:   1003,
+  PROCESSING_FAILED:  1004,
+  RATE_LIMITED:       4001,
+  UNAUTHORIZED:       4003,
+  SERVER_ERROR:       5000,
 } as const
+
+export type WSErrorCode = typeof WS_ERROR_CODES[keyof typeof WS_ERROR_CODES]
