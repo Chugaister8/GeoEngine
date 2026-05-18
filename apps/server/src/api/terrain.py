@@ -1,334 +1,275 @@
 """
 GeoEngine — Terrain REST API
-HTTP ендпоінти для роботи з терейном.
+FastAPI router для DEM операцій.
 
-Маршрути:
-  GET  /api/terrain/tile/{z}/{x}/{y}   — DEM тайл як PNG або JSON
-  GET  /api/terrain/elevation          — висота точки
-  POST /api/terrain/mesh               — mesh для bbox
-  GET  /api/terrain/sources            — список доступних джерел
-  GET  /api/terrain/stats              — статистика кешу
-
-Також використовується для prefetch тайлів до WebSocket запитів.
+Endpoints:
+  GET  /api/terrain/sources
+  GET  /api/terrain/tile/{z}/{x}/{y}/meta
+  GET  /api/terrain/tile/{z}/{x}/{y}.png
+  POST /api/terrain/elevation
+  POST /api/terrain/mesh
+  GET  /api/terrain/cache/stats
+  DELETE /api/terrain/cache
 """
 
 from __future__ import annotations
 
-import asyncio
-from typing import Annotated, Literal
+from typing import Annotated, Any
 
-import numpy as np
-import structlog
-from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, Response
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
-from ..config import settings
-from ..services.terrain import TerrainService, get_terrain_service
-
-log: structlog.BoundLogger = structlog.get_logger(__name__)
+from ..services.terrain import TerrainService
 
 router = APIRouter(prefix="/api/terrain", tags=["terrain"])
 
-
 # ----------------------------------------------------------------
-# REQUEST / RESPONSE МОДЕЛІ
+# REQUEST / RESPONSE MODELS
 # ----------------------------------------------------------------
 
 class ElevationRequest(BaseModel):
-    """Запит висоти для списку точок."""
-    points: list[tuple[float, float]] = Field(
+    points: list[list[float]] = Field(
         ...,
         min_length=1,
         max_length=1000,
-        description="Список (lat, lon) точок"
+        description="Список точок [[lat, lon], ...]",
     )
-    source: str = "copernicus25"
+    source: str = "terrarium"
+    zoom:   int = Field(default=11, ge=4, le=14)
 
-
-class ElevationResponse(BaseModel):
-    """Відповідь з висотами."""
-    points: list[tuple[float, float]]
-    elevations: list[float | None]   # None де дані відсутні
-    source: str
-    unit: str = "meters"
+    @field_validator("points")
+    @classmethod
+    def validate_points(cls, v: list[list[float]]) -> list[list[float]]:
+        for pt in v:
+            if len(pt) != 2:
+                raise ValueError("Кожна точка має бути [lat, lon]")
+            lat, lon = pt
+            if not (-90 <= lat <= 90):
+                raise ValueError(f"lat={lat} поза [-90, 90]")
+            if not (-180 <= lon <= 180):
+                raise ValueError(f"lon={lon} поза [-180, 180]")
+        return v
 
 
 class MeshRequest(BaseModel):
-    """Запит mesh для BBox."""
-    west:           float = Field(..., ge=-180, le=180)
-    south:          float = Field(..., ge=-90,  le=90)
-    east:           float = Field(..., ge=-180, le=180)
-    north:          float = Field(..., ge=-90,  le=90)
-    source:         str   = "copernicus25"
-    max_vertices:   int   = Field(default=65_536, ge=64, le=262_144)
-    lod_level:      int   = Field(default=0, ge=0, le=5)
+    west:         float = Field(..., ge=-180, le=180)
+    south:        float = Field(..., ge=-90,  le=90)
+    east:         float = Field(..., ge=-180, le=180)
+    north:        float = Field(..., ge=-90,  le=90)
+    source:       str   = "terrarium"
+    max_vertices: int   = Field(default=65_536, ge=64, le=262_144)
+    skirt_height_m: float = Field(default=200.0, ge=0.0)
 
+    @field_validator("north")
+    @classmethod
+    def north_gt_south(cls, v: float, info: Any) -> float:
+        data = info.data
+        if "south" in data and v <= data["south"]:
+            raise ValueError("north має бути > south")
+        return v
 
-class MeshResponse(BaseModel):
-    """Відповідь з mesh даними."""
-    vertex_count:   int
-    triangle_count: int
-    bbox:           list[float]
-    origin:         dict
-    buffers:        dict   # base64 encoded
-    min_elevation:  float
-    max_elevation:  float
-    resolution_m:   float
-    memory_bytes:   int
-
-
-class TileMetaResponse(BaseModel):
-    """Метадані тайлу."""
-    tile:           dict
-    bbox:           list[float]
-    min_elevation:  float
-    max_elevation:  float
-    mean_elevation: float
-    coverage_pct:   float
-    resolution_m:   float
-    source:         str
-
-
-class SourceInfo(BaseModel):
-    """Інформація про DEM джерело."""
-    id:              str
-    name:            str
-    resolution_m:    float
-    global_coverage: bool
-    requires_api_key: bool
-
-
-class CacheStats(BaseModel):
-    """Статистика кешу."""
-    files:    int
-    size_mb:  int
-    sources:  dict[str, int]
+    @property
+    def area_deg2(self) -> float:
+        return (self.east - self.west) * (self.north - self.south)
 
 
 # ----------------------------------------------------------------
-# ЕНДПОІНТИ
+# DEPENDENCY
 # ----------------------------------------------------------------
 
-@router.get("/sources", response_model=list[SourceInfo])
-async def list_sources() -> list[SourceInfo]:
-    """
-    Список доступних DEM джерел.
-
-    Returns:
-        Список джерел з метаданими (resolution, coverage, тощо)
-    """
-    from ....packages.core_python.geoengine.dem.sources import SOURCES
-    return [
-        SourceInfo(
-            id=str(src.id),
-            name=src.name,
-            resolution_m=src.resolution_m,
-            global_coverage=src.global_coverage,
-            requires_api_key=src.requires_api_key,
-        )
-        for src in SOURCES.values()
-    ]
+# TerrainService інжектується через FastAPI DI
+# Реальний інстанс створюється у main.py (lifespan)
+_terrain_service: TerrainService | None = None
 
 
-@router.get("/tile/{z}/{x}/{y}/meta", response_model=TileMetaResponse)
+def get_terrain_service() -> TerrainService:
+    if _terrain_service is None:
+        raise RuntimeError("TerrainService не ініціалізований")
+    return _terrain_service
+
+
+def set_terrain_service(svc: TerrainService) -> None:
+    global _terrain_service
+    _terrain_service = svc
+
+
+# ----------------------------------------------------------------
+# ENDPOINTS
+# ----------------------------------------------------------------
+
+@router.get("/sources")
+async def get_sources(
+    svc: Annotated[TerrainService, Depends(get_terrain_service)],
+) -> list[dict[str, Any]]:
+    """Список доступних DEM джерел."""
+    return await svc.get_sources()
+
+
+@router.get("/tile/{z}/{x}/{y}/meta")
 async def get_tile_meta(
-    z:       int,
-    x:       int,
-    y:       int,
-    source:  str = Query(default="copernicus25"),
-    service: TerrainService = Depends(get_terrain_service),
-) -> TileMetaResponse:
-    """
-    Метадані DEM тайлу без повної геометрії.
-    Швидший ніж /mesh — для LOD планування.
-
-    Args:
-        z, x, y: XYZ адреса тайлу
-        source:  DEM джерело
-
-    Returns:
-        Метадані: висоти, resolution, coverage, тощо
-    """
-    _validate_tile(z, x, y)
-
+    z:      int = Path(..., ge=0, le=22),
+    x:      int = Path(..., ge=0),
+    y:      int = Path(..., ge=0),
+    source: str = Query(default="terrarium"),
+    svc:    Annotated[TerrainService, Depends(get_terrain_service)] = None,
+) -> dict[str, Any]:
+    """Метадані тайлу (висоти, розмір, coverage)."""
+    _validate_tile(x, y, z)
     try:
-        meta = await service.get_tile_meta(
-            tile_x=x, tile_y=y, tile_z=z, source=source,
-        )
-    except Exception as exc:
-        log.error("api.tile_meta.error", tile=f"{z}/{x}/{y}", error=str(exc))
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-    return TileMetaResponse(**meta)
+        return await svc.get_tile_meta(x=x, y=y, z=z, source=source)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Помилка сервера: {e}")
 
 
-@router.get(
-    "/tile/{z}/{x}/{y}.png",
-    responses={200: {"content": {"image/png": {}}}},
-)
+@router.get("/tile/{z}/{x}/{y}.png")
 async def get_tile_png(
-    z:       int,
-    x:       int,
-    y:       int,
-    source:  str   = Query(default="terrarium"),
-    colormap: str  = Query(default="terrain"),   # terrain, grayscale, hillshade
-    service: TerrainService = Depends(get_terrain_service),
+    z:        int = Path(..., ge=0, le=22),
+    x:        int = Path(..., ge=0),
+    y:        int = Path(..., ge=0),
+    source:   str = Query(default="terrarium"),
+    colormap: str = Query(default="terrain"),
+    size:     int = Query(default=256, ge=64, le=512),
+    svc:      Annotated[TerrainService, Depends(get_terrain_service)] = None,
 ) -> Response:
-    """
-    DEM тайл як PNG зображення.
-    Підтримує різні colormaps для візуалізації.
-
-    Args:
-        z, x, y:  XYZ адреса
-        source:   DEM джерело
-        colormap: схема кольорів (terrain/grayscale/hillshade)
-
-    Returns:
-        PNG image (256×256 або 512×512)
-    """
-    _validate_tile(z, x, y)
-
+    """Тайл як PNG зображення."""
+    _validate_tile(x, y, z)
     try:
-        png_bytes = await service.get_tile_png(
-            tile_x=x, tile_y=y, tile_z=z,
-            source=source, colormap=colormap,
+        png_bytes = await svc.get_tile_png(
+            x=x, y=y, z=z,
+            source=source,
+            colormap=colormap,
+            size=size,
         )
-    except Exception as exc:
-        log.error("api.tile_png.error", tile=f"{z}/{x}/{y}", error=str(exc))
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        return Response(
+            content=png_bytes,
+            media_type="image/png",
+            headers={
+                "Cache-Control": "public, max-age=86400",
+                "X-Tile":        f"{z}/{x}/{y}",
+            },
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-    return Response(
-        content=png_bytes,
-        media_type="image/png",
-        headers={
-            "Cache-Control": "public, max-age=86400",  # кешуємо 24г
-            "X-Tile":        f"{z}/{x}/{y}",
-            "X-Source":      source,
-        },
-    )
 
-
-@router.post("/elevation", response_model=ElevationResponse)
+@router.post("/elevation")
 async def get_elevation(
     request: ElevationRequest,
-    service: TerrainService = Depends(get_terrain_service),
-) -> ElevationResponse:
+    svc:     Annotated[TerrainService, Depends(get_terrain_service)],
+) -> dict[str, Any]:
     """
     Висоти для списку точок.
 
-    Пакетний запит: до 1000 точок за раз.
-    Використовує біліарну інтерполяцію.
+    Request body:
+        {"points": [[lat, lon], ...], "source": "terrarium"}
 
-    Args:
-        request: список (lat, lon) точок + джерело
-
-    Returns:
-        Список висот у метрах (None де дані відсутні)
+    Response:
+        {"points": [[lat, lon], ...], "elevations": [float|null, ...]}
     """
     try:
-        elevations = await service.get_elevations(
-            points=request.points,
+        elevations = await svc.get_elevations(
+            points=[(pt[0], pt[1]) for pt in request.points],
             source=request.source,
+            zoom=request.zoom,
         )
-    except Exception as exc:
-        log.error("api.elevation.error", count=len(request.points), error=str(exc))
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        return {
+            "points":     request.points,
+            "elevations": [
+                round(float(e), 2) if e is not None else None
+                for e in elevations
+            ],
+            "source":     request.source,
+            "count":      len(elevations),
+        }
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-    return ElevationResponse(
-        points=request.points,
-        elevations=elevations,
-        source=request.source,
-    )
 
-
-@router.post("/mesh", response_model=MeshResponse)
+@router.post("/mesh")
 async def get_mesh(
     request: MeshRequest,
-    service: TerrainService = Depends(get_terrain_service),
-) -> MeshResponse:
+    svc:     Annotated[TerrainService, Depends(get_terrain_service)],
+) -> dict[str, Any]:
     """
-    Terrain mesh для BBox.
+    TerrainMesh для географічного bbox.
 
-    Повертає повний 3D меш у base64 буферах:
-    vertices (Float32), indices (Uint32), uvs (Float32), normals (Float32).
-
-    ⚠️ Для великих BBox може бути повільним — використовуй WebSocket
-    для потокового підвантаження по тайлах.
-
-    Args:
-        request: BBox + source + параметри mesh
-
-    Returns:
-        MeshResponse з base64 буферами
+    Обмеження: bbox не більше 4°×4° (≈ 450×450 км).
     """
     # Перевірка розміру bbox
-    area_deg2 = (request.east - request.west) * (request.north - request.south)
-    if area_deg2 > 4.0:  # > ~2°×2° = ~50000км²
+    if request.area_deg2 > 16.0:
         raise HTTPException(
             status_code=400,
             detail=(
-                f"BBox занадто великий ({area_deg2:.2f}°²). "
-                "Максимум 4°². Використовуй WebSocket для великих областей."
+                f"BBox занадто великий: {request.area_deg2:.1f}°². "
+                "Максимум: 4°×4° (16°²)."
             ),
         )
 
+    # Визначаємо центральний тайл
+    from geoengine.geo.projection import latlon_to_tile
+    from geoengine.geo.bbox import BBox
+
+    center_lat = (request.south + request.north) / 2
+    center_lon = (request.west  + request.east)  / 2
+
+    # Zoom залежно від розміру bbox
+    area   = request.area_deg2
+    zoom   = 12 if area < 0.01 else 10 if area < 0.25 else 8
+
+    tile   = latlon_to_tile(center_lat, center_lon, zoom=zoom)
+
     try:
-        from ....packages.core_python.geoengine.geo.bbox import BBox
-        bbox = BBox(
-            west=request.west, south=request.south,
-            east=request.east, north=request.north,
-        )
-        mesh_data = await service.get_bbox_mesh(
-            bbox=bbox,
+        mesh_data = await svc.get_tile_mesh(
+            x=tile.x,
+            y=tile.y,
+            z=tile.z,
             source=request.source,
             max_vertices=request.max_vertices,
-            lod_level=request.lod_level,
+            skirt_height_m=request.skirt_height_m,
         )
-    except Exception as exc:
-        log.error("api.mesh.error", error=str(exc))
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        return mesh_data
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-    return MeshResponse(**mesh_data)
 
-
-@router.get("/cache/stats", response_model=CacheStats)
-async def get_cache_stats(
-    service: TerrainService = Depends(get_terrain_service),
-) -> CacheStats:
-    """Статистика DEM кешу."""
-    stats = await service.get_cache_stats()
-    return CacheStats(**stats)
+@router.get("/cache/stats")
+async def cache_stats(
+    svc: Annotated[TerrainService, Depends(get_terrain_service)],
+) -> dict[str, Any]:
+    """Статистика кешу."""
+    return await svc.cache_stats()
 
 
 @router.delete("/cache")
 async def clear_cache(
-    source: str | None = Query(default=None),
-    service: TerrainService = Depends(get_terrain_service),
-) -> dict:
-    """
-    Очистити DEM кеш.
-
-    Args:
-        source: очистити конкретне джерело або все (None)
-
-    Returns:
-        {"deleted": N} — кількість видалених файлів
-    """
-    deleted = await service.clear_cache(source=source)
-    return {"deleted": deleted, "source": source or "all"}
+    source: str = Query(default="all"),
+    svc:    Annotated[TerrainService, Depends(get_terrain_service)] = None,
+) -> dict[str, Any]:
+    """Очистити кеш."""
+    return await svc.clear_cache(source=source)
 
 
 # ----------------------------------------------------------------
-# УТИЛІТИ
+# HELPERS
 # ----------------------------------------------------------------
 
-def _validate_tile(z: int, x: int, y: int) -> None:
-    """Валідувати XYZ тайл координати."""
-    if not (0 <= z <= 22):
-        raise HTTPException(status_code=400, detail=f"zoom={z} поза [0, 22]")
-    max_idx = (1 << z) - 1
-    if not (0 <= x <= max_idx):
-        raise HTTPException(status_code=400, detail=f"x={x} поза [0, {max_idx}]")
-    if not (0 <= y <= max_idx):
-        raise HTTPException(status_code=400, detail=f"y={y} поза [0, {max_idx}]")
+def _validate_tile(x: int, y: int, z: int) -> None:
+    """Перевірити що тайл валідний для zoom рівня."""
+    max_xy = (1 << z) - 1
+    if x > max_xy or y > max_xy:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Невалідні координати тайлу: {z}/{x}/{y}. "
+                f"При zoom={z} максимум: x,y ≤ {max_xy}"
+            ),
+)
