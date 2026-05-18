@@ -1,79 +1,38 @@
 """
 GeoEngine — Server Configuration
-Всі налаштування через Pydantic Settings + .env файл.
 """
 
 from __future__ import annotations
 
-from functools import lru_cache
-from pathlib import Path
-from typing import Any
-
-from pydantic import Field, field_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from geoengine.utils.config import BaseGeoConfig
 
 
-class Settings(BaseSettings):
+class ServerConfig(BaseGeoConfig):
     """
-    Налаштування сервера.
-
-    Завантажуються з:
-    1. .env файл (GEOENGINE_.env)
-    2. Змінні середовища (GEOENGINE_*)
-    3. Дефолтні значення
+    Конфігурація FastAPI сервера.
+    Розширює BaseGeoConfig серверними параметрами.
     """
 
-    model_config = SettingsConfigDict(
-        env_prefix="GEOENGINE_",
-        env_file=".env",
-        env_file_encoding="utf-8",
-        case_sensitive=False,
-    )
+    # WebSocket
+    ws_max_connections:  int   = 100
+    ws_rate_limit:       float = 10.0    # req/sec per connection
+    ws_rate_burst:       float = 20.0    # burst capacity
 
-    # ---- Server ----
-    host:      str   = "0.0.0.0"
-    port:      int   = Field(default=8000, ge=1, le=65535)
-    debug:     bool  = False
-    log_level: str   = "info"
-    cors_origins: list[str] = ["http://localhost:3000", "http://localhost:5173"]
+    # Terrain
+    max_mesh_vertices:   int   = 262_144
+    max_bbox_area_deg2:  float = 16.0    # 4°×4°
 
-    # ---- WebSocket ----
-    ws_timeout_s:        float = 60.0    # таймаут keepalive
-    ws_max_message_size: int   = 10 * 1024 * 1024  # 10MB
+    # OSM
+    max_osm_bbox_deg2:   float = 1.0     # 1°×1°
 
-    # ---- DEM / Terrain ----
-    dem_cache_dir:    Path  = Path.home() / ".geoengine" / "dem_cache"
-    dem_api_keys:     dict[str, str] = Field(default_factory=dict)
-    terrain_workers:  int   = 4    # ThreadPool для mesh build
-    dem_fetch_workers: int  = 4    # паралельні DEM завантаження
-    mesh_cache_size:  int   = 256  # max кешованих mesh dict-ів
+    # Timeouts
+    dem_fetch_timeout:   float = 120.0   # секунди
+    osm_fetch_timeout:   float = 120.0
 
-    # ---- Analysis ----
-    analysis_workers: int = 2
-
-    # ---- Paths ----
-    data_dir: Path = Path("./data")
-
-    @field_validator("dem_cache_dir", "data_dir", mode="before")
     @classmethod
-    def expand_path(cls, v: Any) -> Path:
-        return Path(v).expanduser()
-
-    @field_validator("dem_api_keys", mode="before")
-    @classmethod
-    def parse_api_keys(cls, v: Any) -> dict[str, str]:
-        """Підтримує як dict так і JSON рядок."""
-        if isinstance(v, str):
-            import json
-            return json.loads(v)
-        return v or {}
+    def from_env(cls) -> "ServerConfig":
+        return cls()
 
 
-@lru_cache(maxsize=1)
-def get_settings() -> Settings:
-    """Singleton Settings — кешується після першого виклику."""
-    return Settings()
-
-
-# Зручний доступ
-settings = get_settings()
+# Глобальний інстанс
+config = ServerConfig()
