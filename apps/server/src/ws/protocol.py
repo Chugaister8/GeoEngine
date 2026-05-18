@@ -1,342 +1,256 @@
 """
 GeoEngine — WebSocket Protocol
-Типи повідомлень між Python сервером та JS клієнтом.
+Pydantic моделі для всіх WS повідомлень.
 
-Всі повідомлення — JSON об'єкти з полями:
-  type:      рядковий ідентифікатор типу
-  id:        UUID запиту (для match request→response)
-  timestamp: Unix мілісекунди
-  payload:   тіло повідомлення (залежить від type)
+Протокол (Client → Server):
+  ping              { type, id, timestamp, payload:{} }
+  request_tile      { ..., payload:{tile, source, max_vertices, skirt_height_m} }
+  request_analysis  { ..., payload:{bbox, analyses, source, options} }
+  camera_update     { ..., payload:{lat,lon,alt,heading,pitch} }
 
-Клієнт → Сервер:
-  request_tile     — запит DEM тайлу
-  request_analysis — запит аналітики (slope, viewshed, тощо)
-  subscribe_stream — підписка на live дані
-  ping             — keepalive
-
-Сервер → Клієнт:
-  response_tile    — DEM меш у відповідь на request_tile
-  analysis_result  — результат аналізу
-  stream_update    — live оновлення (IoT, погода)
-  error            — помилка
-  pong             — відповідь на ping
+Протокол (Server → Client):
+  pong              { type, id, request_id, timestamp, payload:{latency_ms} }
+  response_tile     { ..., payload:{tile, lod_level, vertex_count, buffers,...} }
+  analysis_result   { ..., payload:{analysis_type, result_type, data,...} }
+  error             { ..., payload:{code, message} }
+  connected         { ..., payload:{session_id, server_version} }
 """
 
 from __future__ import annotations
 
 import time
 import uuid
-from enum import StrEnum
-from typing import Annotated, Any, Literal, Union
+from typing import Any, Literal, Union
 
 from pydantic import BaseModel, Field, field_validator
 
 
 # ----------------------------------------------------------------
-# БАЗОВІ ТИПИ
+# BASE
 # ----------------------------------------------------------------
 
-class MessageType(StrEnum):
-    # Клієнт → Сервер
-    REQUEST_TILE     = "request_tile"
-    REQUEST_ANALYSIS = "request_analysis"
-    SUBSCRIBE_STREAM = "subscribe_stream"
-    UNSUBSCRIBE      = "unsubscribe"
-    PING             = "ping"
+class WSBase(BaseModel):
+    """Базова модель WS повідомлення."""
+    type:      str
+    id:        str   = Field(default_factory=lambda: str(uuid.uuid4()))
+    timestamp: float = Field(default_factory=lambda: time.time() * 1000)
 
-    # Сервер → Клієнт
-    RESPONSE_TILE    = "response_tile"
-    ANALYSIS_RESULT  = "analysis_result"
-    STREAM_UPDATE    = "stream_update"
-    ERROR            = "error"
-    PONG             = "pong"
 
+# ----------------------------------------------------------------
+# CLIENT → SERVER
+# ----------------------------------------------------------------
 
 class TileXYZ(BaseModel):
-    """XYZ тайл адреса."""
     x: int = Field(ge=0)
     y: int = Field(ge=0)
     z: int = Field(ge=0, le=22)
 
-    model_config = {"frozen": True}
-
 
 class BBoxModel(BaseModel):
-    """Географічний BBox."""
     west:  float = Field(ge=-180, le=180)
     south: float = Field(ge=-90,  le=90)
     east:  float = Field(ge=-180, le=180)
     north: float = Field(ge=-90,  le=90)
 
-    model_config = {"frozen": True}
-
     @field_validator("north")
     @classmethod
-    def north_gt_south(cls, north: float, info: Any) -> float:
-        south = info.data.get("south", -90)
-        if north <= south:
-            raise ValueError(f"north={north} має бути > south={south}")
-        return north
+    def north_gt_south(cls, v: float, info: Any) -> float:
+        if "south" in (info.data or {}) and v <= info.data["south"]:
+            raise ValueError("north must be > south")
+        return v
 
 
-class DEMSourceEnum(StrEnum):
-    SRTM30       = "srtm30"
-    SRTM90       = "srtm90"
-    COPERNICUS25 = "copernicus25"
-    TERRARIUM    = "terrarium"
-    CUSTOM       = "custom"
+class PingPayload(BaseModel):
+    pass
 
-
-# ----------------------------------------------------------------
-# БАЗОВИЙ КЛАС ПОВІДОМЛЕННЯ
-# ----------------------------------------------------------------
-
-class BaseMessage(BaseModel):
-    """Базове повідомлення протоколу."""
-    type:      str
-    id:        str = Field(default_factory=lambda: str(uuid.uuid4()))
-    timestamp: int = Field(default_factory=lambda: int(time.time() * 1000))
-
-    model_config = {"frozen": True}
-
-
-# ----------------------------------------------------------------
-# КЛІЄНТ → СЕРВЕР
-# ----------------------------------------------------------------
 
 class RequestTilePayload(BaseModel):
-    """Payload запиту тайлу."""
-    tile:   TileXYZ
-    source: DEMSourceEnum = DEMSourceEnum.COPERNICUS25
-    # Опційні параметри
-    include_normals:  bool  = True
-    include_analysis: bool  = False   # додати slope/hillshade у відповідь
-    skirt_height_m:   float = Field(default=200.0, ge=0, le=10_000)
-    max_vertices:     int   = Field(default=65_536, ge=64, le=262_144)
-
-    model_config = {"frozen": True}
+    tile:           TileXYZ
+    source:         str     = "terrarium"
+    max_vertices:   int     = Field(default=65_536, ge=64, le=262_144)
+    skirt_height_m: float   = Field(default=200.0, ge=0.0)
+    lod_level:      int     = Field(default=0, ge=0, le=5)
 
 
 class RequestAnalysisPayload(BaseModel):
-    """Payload запиту аналізу."""
-    bbox:     BBoxModel
-    analyses: list[Literal[
-        "slope", "aspect", "hillshade",
-        "contours", "viewshed", "flood",
-    ]]
-    # Параметри специфічних аналізів
-    contour_interval_m: float = 100.0
-    viewshed_observer:  tuple[float, float, float] | None = None  # lat, lon, height_m
-    viewshed_radius_m:  float = 5000.0
-    flood_level_m:      float = 0.0
-    hillshade_azimuth:  float = 315.0
-    hillshade_altitude: float = 45.0
-
-    model_config = {"frozen": True}
+    bbox:      BBoxModel
+    analyses:  list[str]  = Field(default=["slope"])
+    source:    str        = "terrarium"
+    options:   dict[str, Any] = Field(default_factory=dict)
 
 
-class SubscribeStreamPayload(BaseModel):
-    """Підписка на потік даних."""
-    stream_type: Literal["weather", "iot", "gps_track", "satellite"]
-    bbox:        BBoxModel | None = None
-    interval_s:  float = Field(default=10.0, ge=1, le=3600)
+class CameraUpdatePayload(BaseModel):
+    lat:     float
+    lon:     float
+    alt:     float
+    heading: float = 0.0
+    pitch:   float = -30.0
+    fov:     float = 60.0
 
-    model_config = {"frozen": True}
+
+class WSPing(WSBase):
+    type:    Literal["ping"]
+    payload: PingPayload = Field(default_factory=PingPayload)
 
 
-# ---- Повідомлення клієнта ----
-
-class RequestTileMessage(BaseMessage):
-    type:    Literal[MessageType.REQUEST_TILE] = MessageType.REQUEST_TILE
+class WSRequestTile(WSBase):
+    type:    Literal["request_tile"]
     payload: RequestTilePayload
 
 
-class RequestAnalysisMessage(BaseMessage):
-    type:    Literal[MessageType.REQUEST_ANALYSIS] = MessageType.REQUEST_ANALYSIS
+class WSRequestAnalysis(WSBase):
+    type:    Literal["request_analysis"]
     payload: RequestAnalysisPayload
 
 
-class SubscribeStreamMessage(BaseMessage):
-    type:    Literal[MessageType.SUBSCRIBE_STREAM] = MessageType.SUBSCRIBE_STREAM
-    payload: SubscribeStreamPayload
+class WSCameraUpdate(WSBase):
+    type:    Literal["camera_update"]
+    payload: CameraUpdatePayload
 
 
-class UnsubscribeMessage(BaseMessage):
-    type: Literal[MessageType.UNSUBSCRIBE] = MessageType.UNSUBSCRIBE
-    payload: dict[str, str] = Field(default_factory=dict)  # {"stream_id": "..."}
-
-
-class PingMessage(BaseMessage):
-    type:    Literal[MessageType.PING] = MessageType.PING
-    payload: dict = Field(default_factory=dict)
-
-
-# Union всіх клієнтських повідомлень
-ClientMessage = Annotated[
-    Union[
-        RequestTileMessage,
-        RequestAnalysisMessage,
-        SubscribeStreamMessage,
-        UnsubscribeMessage,
-        PingMessage,
-    ],
-    Field(discriminator="type"),
+# Union для парсингу будь-якого клієнтського повідомлення
+WSClientMessage = Union[
+    WSPing,
+    WSRequestTile,
+    WSRequestAnalysis,
+    WSCameraUpdate,
 ]
 
 
 # ----------------------------------------------------------------
-# СЕРВЕР → КЛІЄНТ
+# SERVER → CLIENT
 # ----------------------------------------------------------------
 
-class TileOrigin(BaseModel):
-    """Origin координати для ENU системи."""
-    lat: float
-    lon: float
-    alt: float = 0.0
+class WSPong(WSBase):
+    type:       Literal["pong"] = "pong"
+    request_id: str
 
-    model_config = {"frozen": True}
+    class Config:
+        extra = "allow"
 
 
-class TileBuffers(BaseModel):
-    """Base64-кодовані GPU буфери."""
-    vertices: str   # base64(Float32Array) (N,3) XYZ метри ENU
-    indices:  str   # base64(Uint32Array)  (M,3) трикутники
-    uvs:      str   # base64(Float32Array) (N,2) текстурні координати
-    normals:  str   # base64(Float32Array) (N,3) нормалі
-
-    model_config = {"frozen": True}
+class TerrainMeshBuffers(BaseModel):
+    vertices: str    # base64 Float32Array
+    indices:  str    # base64 Uint32Array
+    uvs:      str    # base64 Float32Array
+    normals:  str    # base64 Float32Array
 
 
 class ResponseTilePayload(BaseModel):
-    """Payload відповіді з тайлом."""
-    type:           Literal["terrain_mesh"] = "terrain_mesh"
+    tile:           TileXYZ
     lod_level:      int
     vertex_count:   int
     triangle_count: int
-    bbox:           list[float]   # [west, south, east, north]
-    origin:         TileOrigin
-    buffers:        TileBuffers
-    # Метадані
+    memory_bytes:   int
+    bbox:           BBoxModel
+    origin:         dict[str, float]   # {lat, lon, alt}
     min_elevation:  float
     max_elevation:  float
     source:         str
-    resolution_m:   float
-    memory_bytes:   int
+    buffers:        TerrainMeshBuffers
+    normal_map:     dict[str, Any] | None = None
 
-    model_config = {"frozen": True}
+
+class WSResponseTile(WSBase):
+    type:       Literal["response_tile"] = "response_tile"
+    request_id: str
+    payload:    ResponseTilePayload
 
 
 class AnalysisResultPayload(BaseModel):
-    """Payload результату аналізу."""
     analysis_type: str
-    bbox:          list[float]
-    # Результат залежно від типу
-    # slope/aspect/hillshade: base64 float32 raster
-    # contours: GeoJSON FeatureCollection
-    # viewshed: base64 bool raster
-    result_type:   Literal["raster", "geojson", "value"]
-    data:          str | dict   # base64 або GeoJSON
+    result_type:   str
+    bbox:          BBoxModel
+    data:          str | None = None     # base64
     width:         int | None = None
     height:        int | None = None
-    metadata:      dict = Field(default_factory=dict)
-
-    model_config = {"frozen": True}
-
-
-class ErrorPayload(BaseModel):
-    """Payload помилки."""
-    code:    int
-    message: str
-    detail:  Any = None
-
-    model_config = {"frozen": True}
+    min_val:       float | None = None
+    max_val:       float | None = None
+    geojson:       dict | None = None
+    profile:       dict | None = None
 
 
-class ErrorCode:
-    """Коди помилок."""
-    UNKNOWN_MESSAGE_TYPE = 1001
-    INVALID_PAYLOAD      = 1002
-    TILE_NOT_FOUND       = 2001
-    DEM_FETCH_FAILED     = 2002
-    ANALYSIS_FAILED      = 3001
-    RATE_LIMITED         = 4001
-    INTERNAL_ERROR       = 5000
-
-
-# ---- Повідомлення сервера ----
-
-class ResponseTileMessage(BaseMessage):
-    type:        Literal[MessageType.RESPONSE_TILE] = MessageType.RESPONSE_TILE
-    request_id:  str    # id оригінального RequestTileMessage
-    payload:     ResponseTilePayload
-
-
-class AnalysisResultMessage(BaseMessage):
-    type:       Literal[MessageType.ANALYSIS_RESULT] = MessageType.ANALYSIS_RESULT
+class WSAnalysisResult(WSBase):
+    type:       Literal["analysis_result"] = "analysis_result"
     request_id: str
     payload:    AnalysisResultPayload
 
 
-class ErrorMessage(BaseMessage):
-    type:       Literal[MessageType.ERROR] = MessageType.ERROR
+class ErrorPayload(BaseModel):
+    code:    int
+    message: str
+    details: str | None = None
+
+
+class WSError(WSBase):
+    type:       Literal["error"] = "error"
     request_id: str | None = None
     payload:    ErrorPayload
 
 
-class PongMessage(BaseMessage):
-    type:    Literal[MessageType.PONG] = MessageType.PONG
-    payload: dict = Field(default_factory=dict)
+class ConnectedPayload(BaseModel):
+    session_id:     str
+    server_version: str = "0.1.0"
+    capabilities:   list[str] = Field(default_factory=list)
 
 
-# Union всіх серверних повідомлень
-ServerMessage = Union[
-    ResponseTileMessage,
-    AnalysisResultMessage,
-    ErrorMessage,
-    PongMessage,
-]
+class WSConnected(WSBase):
+    type:    Literal["connected"] = "connected"
+    payload: ConnectedPayload
 
 
 # ----------------------------------------------------------------
-# ПАРСЕР ВХІДНИХ ПОВІДОМЛЕНЬ
+# ПАРСИНГ
 # ----------------------------------------------------------------
 
-from pydantic import TypeAdapter
+_CLIENT_TYPES: dict[str, type] = {
+    "ping":             WSPing,
+    "request_tile":     WSRequestTile,
+    "request_analysis": WSRequestAnalysis,
+    "camera_update":    WSCameraUpdate,
+}
 
-_client_adapter: TypeAdapter[ClientMessage] = TypeAdapter(ClientMessage)
 
-
-def parse_client_message(raw: str | bytes | dict) -> ClientMessage:
+def parse_client_message(
+    data: dict[str, Any],
+) -> WSClientMessage | None:
     """
-    Розпарсити повідомлення від клієнта.
-
-    Args:
-        raw: JSON рядок, bytes або вже розпарсений dict
-
-    Returns:
-        Типізоване повідомлення клієнта
-
-    Raises:
-        pydantic.ValidationError: невалідний формат
-        ValueError:               невідомий type
+    Розпарсити JSON dict у відповідну Pydantic модель.
+    Повертає None якщо type невідомий або дані невалідні.
     """
-    import json
-    if isinstance(raw, (str, bytes)):
-        data = json.loads(raw)
-    else:
-        data = raw
+    msg_type = data.get("type", "")
+    model_cls = _CLIENT_TYPES.get(msg_type)
+    if model_cls is None:
+        return None
+    try:
+        return model_cls.model_validate(data)
+    except Exception:
+        return None
 
-    return _client_adapter.validate_python(data)
+
+def make_pong(request_id: str, latency_ms: float = 0.0) -> dict:
+    return WSPong(
+        request_id=request_id,
+        payload={"latency_ms": latency_ms},
+    ).model_dump()
 
 
 def make_error(
     code:       int,
     message:    str,
     request_id: str | None = None,
-    detail:     Any = None,
-) -> ErrorMessage:
-    """Зручний конструктор повідомлення про помилку."""
-    return ErrorMessage(
+    details:    str | None = None,
+) -> dict:
+    return WSError(
         request_id=request_id,
-        payload=ErrorPayload(code=code, message=message, detail=detail),
-    )
+        payload=ErrorPayload(code=code, message=message, details=details),
+    ).model_dump()
+
+
+def make_connected(session_id: str) -> dict:
+    return WSConnected(
+        payload=ConnectedPayload(
+            session_id=session_id,
+            capabilities=["terrain", "analysis", "osm"],
+        )
+    ).model_dump()
